@@ -2,13 +2,10 @@ import asyncio
 import os
 import math
 import time
-import logging
 from datetime import datetime, timezone
 from typing import List
 
 from macd import compute_macd_histogram, flipped_negative_to_positive_at_open
-
-logger = logging.getLogger(__name__)
 
 TF_TO_SECONDS = {
     "5": 5*60,
@@ -25,10 +22,8 @@ class Scheduler:
         self.notifier = notifier
         self.macd_fast, self.macd_slow, self.macd_signal = macd_params
         self.token_bucket = token_bucket
-
         self._running = False
         self.symbols = []
-        self._init_task = None
         self._task = None
         self._scanner_task = None
         self._trim_task = None
@@ -37,60 +32,19 @@ class Scheduler:
         self.backfill_limit = int(os.getenv("BACKFILL_LIMIT", "200"))
 
     async def start(self):
-        """
-        Start the scheduler in a non-blocking way.
-        This method returns quickly and does heavy init in a background task.
-        """
-        if self._running:
-            return
+        await self.token_bucket.start()
         self._running = True
-        if self._init_task is None:
-            self._init_task = asyncio.create_task(self._init_background())
-
-    async def _init_background(self):
-        """
-        Heavy initialization runs here so `start()` doesn't block FastAPI startup.
-        Symbols/backfill are fetched in background; periodic loops start immediately.
-        """
-        try:
-            # Ensure token bucket running (idempotent)
-            try:
-                await self.token_bucket.start()
-            except Exception:
-                logger.exception("token_bucket.start failed (continuing)")
-
-            # Best-effort fetch symbols (can fail; scheduler still runs)
-            try:
-                self.symbols = await self.bybit.get_symbols()
-                logger.info("Fetched %d symbols", len(self.symbols))
-            except Exception:
-                logger.exception("Failed to fetch symbols; continuing with empty list")
-                self.symbols = []
-
-            # Start periodic loops immediately (they will operate with current state)
-            self._task = asyncio.create_task(self._candle_open_loops())
-            self._scanner_task = asyncio.create_task(self._five_min_scanner())
-            self._trim_task = asyncio.create_task(self._trim_loop())
-
-            # Kick off backfill in its own background task (non-blocking)
-            asyncio.create_task(self._backfill_all())
-
-        except Exception:
-            logger.exception("Unexpected error in scheduler initialization")
+        self.symbols = await self.bybit.get_symbols()
+        await self._backfill_all()
+        self._task = asyncio.create_task(self._candle_open_loops())
+        self._scanner_task = asyncio.create_task(self._five_min_scanner())
+        self._trim_task = asyncio.create_task(self._trim_loop())
 
     async def stop(self):
         self._running = False
-        # cancel init task if still running
-        for t in (self._init_task, self._task, self._scanner_task, self._trim_task):
+        for t in (self._task, self._scanner_task, self._trim_task):
             if t:
-                try:
-                    t.cancel()
-                except Exception:
-                    pass
-        self._init_task = None
-        self._task = None
-        self._scanner_task = None
-        self._trim_task = None
+                t.cancel()
 
     async def _backfill_all(self):
         tfs = [x.strip() for x in os.getenv("BACKFILL_TFS", "1440,240,60").split(",")]
@@ -100,8 +54,7 @@ class Scheduler:
             for sym in self.symbols[i:i+batch]:
                 for tf in tfs:
                     tasks.append(self._fetch_and_store(sym, tf))
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks)
             await asyncio.sleep(0.2)
 
     async def _fetch_and_store(self, symbol, tf, limit=None):
@@ -109,10 +62,9 @@ class Scheduler:
             limit = limit or self.backfill_limit
             klines = await self.bybit.get_klines(symbol, tf, limit=limit)
             if klines:
-                # save in thread to avoid blocking event loop
                 await asyncio.to_thread(self.store.save_candles, symbol, tf, klines)
         except Exception:
-            logger.exception("fetch_and_store failed for %s %s", symbol, tf)
+            return
 
     async def _wait_until_next(self, period_seconds: int):
         now = datetime.now(timezone.utc)
@@ -123,23 +75,17 @@ class Scheduler:
 
     async def _candle_open_loops(self):
         while self._running:
-            try:
-                await self._wait_until_next(TF_TO_SECONDS["60"])
-                await self._run_tf_check("60")
-                now = datetime.now(timezone.utc)
-                if now.hour % 4 == 0:
-                    await self._run_tf_check("240")
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("error in _candle_open_loops")
+            await self._wait_until_next(TF_TO_SECONDS["60"])
+            await self._run_tf_check("60")
+            now = datetime.now(timezone.utc)
+            if now.hour % 4 == 0:
+                await self._run_tf_check("240")
 
     async def _run_tf_check(self, tf: str):
         batch = self.batch
         for i in range(0, len(self.symbols), batch):
             tasks = [self._process_symbol_tf(sym, tf) for sym in self.symbols[i:i+batch]]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks)
             await asyncio.sleep(0.2)
 
     async def _process_symbol_tf(self, symbol: str, tf: str):
@@ -169,17 +115,12 @@ class Scheduler:
                     if lazy_tf:
                         await self._fetch_and_store(symbol, lazy_tf, limit=200)
         except Exception:
-            logger.exception("error processing %s %s", symbol, tf)
+            return
 
     async def _five_min_scanner(self):
         while self._running:
-            try:
-                await self._wait_until_next(TF_TO_SECONDS["5"])
-                await self._scan_active_signals()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("error in _five_min_scanner")
+            await self._wait_until_next(TF_TO_SECONDS["5"])
+            await self._scan_active_signals()
 
     async def _scan_active_signals(self):
         tasks = []
@@ -188,7 +129,7 @@ class Scheduler:
             for sym in symbols:
                 tasks.append(self._check_alignment(sym, root_tf))
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks)
 
     async def _check_alignment(self, symbol: str, root_tf: str):
         try:
@@ -231,15 +172,13 @@ class Scheduler:
                     await self.notifier.send(msg)
                     await asyncio.to_thread(self.store.set_last_notified, symbol, root_tf, last_flip_ts)
         except Exception:
-            logger.exception("error checking alignment for %s %s", symbol, root_tf)
+            return
 
     async def _trim_loop(self):
         interval = int(os.getenv("TRIM_INTERVAL_MINUTES", "60")) * 60
         while self._running:
             try:
                 await asyncio.to_thread(self.store.trim_all)
-            except asyncio.CancelledError:
-                break
             except Exception:
-                logger.exception("error in trim loop")
+                pass
             await asyncio.sleep(interval)
