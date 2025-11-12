@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+aiohttp
+python-dotenv
+pydantic
+httpx
+python-dateutil
+aioredis>=2.0.0
+redis
