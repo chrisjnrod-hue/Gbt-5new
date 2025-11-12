@@ -64,21 +64,3 @@ async def health(x_cron_secret: Optional[str] = Header(None)):
         if not x_cron_secret or x_cron_secret != CRON_SECRET:
             raise HTTPException(status_code=403, detail="Forbidden")
     return {"status": "ok"}
-  from fastapi import FastAPI
-from fastapi.responses import FileResponse, RedirectResponse
-
-app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "note": "Service running. Use /health for scheduler pings."}
-
-@app.get("/favicon.ico")
-async def favicon():
-    # If you have a static/favicon.ico file in your repo; otherwise return 404 intentionally removed
-    try:
-        return FileResponse("static/favicon.ico")
-    except Exception:
-        # fallback simple 204 so browser stops retrying
-        from fastapi.responses import Response
-        return Response(status_code=204)
