@@ -1,4 +1,5 @@
 import os
+import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from typing import Optional
@@ -25,28 +26,42 @@ CRON_SECRET = os.getenv("CRON_SECRET", "")
 app = FastAPI()
 
 store = SQLiteStore(SQLITE_DB_PATH)
-
 token_bucket = TokenBucket(capacity=REST_MAX_TOKENS, refill_interval=REST_REFILL_SECONDS)
 bybit = BybitClientV5(BYBIT_REST_BASE, token_bucket)
 notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 scheduler = Scheduler(bybit, store, notifier, (MACD_FAST, MACD_SLOW, MACD_SIGNAL), token_bucket)
 
+
 @app.on_event("startup")
 async def startup_event():
+    print("[Main] Starting token bucket...")
     await token_bucket.start()
-    await scheduler.start()
-    # light backfill re-check to catch missed opens while sleeping
+
+    # ✅ Run scheduler in the background so FastAPI can start immediately
+    asyncio.create_task(scheduler.start())
+    print("[Main] Scheduler launched in background ✅")
+
+    # optional: run a light backfill in background too
+    asyncio.create_task(_safe_backfill())
+
+
+async def _safe_backfill():
+    """Run a backfill after startup without blocking the API."""
     try:
+        await asyncio.sleep(3)
         await scheduler._backfill_all()
-    except Exception:
-        pass
+        print("[Main] Backfill task completed ✅")
+    except Exception as e:
+        print(f"[Main] Backfill failed: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    print("[Main] Shutting down...")
     try:
         await scheduler.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Main] Error stopping scheduler: {e}")
     try:
         await bybit.close()
     except Exception:
@@ -55,22 +70,17 @@ async def shutdown_event():
         await notifier.close()
     except Exception:
         pass
+    print("[Main] Shutdown complete ✅")
+
 
 @app.get("/health")
 async def health(x_cron_secret: Optional[str] = Header(None)):
-    # If CRON_SECRET is set in env, require the header X-Cron-Secret to match.
-    # cron-job.org can be configured to send this header.
     if CRON_SECRET:
         if not x_cron_secret or x_cron_secret != CRON_SECRET:
             raise HTTPException(status_code=403, detail="Forbidden")
     return {"status": "ok"}
 
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    """
-    Basic root route for Render health checks and uptime pingers.
-    Accepts GET and HEAD methods.
-    """
     return {"status": "ok", "message": "service running"}
-
-
