@@ -90,10 +90,11 @@ class BybitClientV5:
             parsed = []
             for k in items:
                 # Bybit returns [startTime, open, high, low, close, volume, turnover]
-                start = int(k[0]) // 1000
-                # ✅ Skip impossible timestamps (roughly <2001 or > 2033)
-                if start < 1_000_000_000 or start > 2_000_000_0000:
-                    print(f"[WARN] Skipping abnormal candle timestamp {start} for {symbol}-{interval}")
+                start_raw = int(k[0])
+                start = start_raw // 1000 if start_raw > 10_000_000_000 else start_raw
+                # ✅ Skip impossible timestamps (roughly <2010 or >2035)
+                if start < 1_260_000_000 or start > 2_070_000_0000:
+                    print(f"[WARN] Skipping abnormal candle timestamp {start_raw} for {symbol}-{interval}")
                     continue
 
                 candle = {
@@ -106,7 +107,6 @@ class BybitClientV5:
                 }
                 parsed.append(candle)
 
-            # Ensure chronological order
             return list(reversed(parsed))
         except Exception as e:
             print(f"[BybitClientV5] get_klines error for {symbol}-{interval}: {e}")
