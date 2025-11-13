@@ -81,6 +81,14 @@ class Scheduler:
 
     async def _candle_open_loops(self):
         print("[Scheduler] Entered candle open loop")
+
+        # ✅ Run immediately on startup
+        await self._run_tf_check("60")
+        now = datetime.now(timezone.utc)
+        if now.hour % 4 == 0:
+            await self._run_tf_check("240")
+
+        # ✅ Then continue every hour afterward
         while self._running:
             await self._wait_until_next(TF_TO_SECONDS["60"])
             await self._run_tf_check("60")
