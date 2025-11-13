@@ -46,20 +46,32 @@ class Scheduler:
         self.ws_client = BybitWebSocketClient(category="linear")
         await self.ws_client.connect()
 
-        async def on_kline(data):
+        # ✅ Fixed callback parsing logic
+        async def on_kline(msg):
             try:
-                k = data["data"][0]
-                symbol = k["symbol"]
-                tf = k["interval"]
+                topic = msg.get("topic", "")
+                parts = topic.split(".")
+                if len(parts) < 3:
+                    print(f"[WS] Unexpected topic format: {topic}")
+                    return
+
+                _, tf, symbol = parts  # e.g. "kline.5.BTCUSDT"
+                data = msg.get("data", [])
+                if not data:
+                    return
+
+                k = data[0]
                 candle = {
                     "open_time": int(k.get("start", time.time())),
                     "close": float(k.get("close", 0.0)),
                     "_raw": k,
                 }
+
                 await asyncio.to_thread(self.store.save_candles, symbol, tf, [candle])
             except Exception as e:
                 print(f"[WS] Kline callback error: {e}")
 
+        # Subscribe limited number for performance
         limit = int(os.getenv("WS_SYMBOL_LIMIT", "50"))
         for sym in self.symbols[:limit]:
             await self.ws_client.subscribe_kline(sym, "5", on_kline)
@@ -182,7 +194,7 @@ class Scheduler:
     # ALIGNMENT / ALERT LOGIC
     # ---------------------------------------------------------------------- #
     async def _check_alignment(self, symbol: str, root_tf: str):
-        """Confirm alignment between root signal TF and smaller TFs."""
+        """Confirm alignment: root TF flip + smaller TF current flip."""
         try:
             all_tfs = ["1440", "240", "60", "15", "5"]
             tfs_to_check = [tf for tf in all_tfs if tf != root_tf]
