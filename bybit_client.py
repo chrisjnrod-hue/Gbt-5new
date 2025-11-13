@@ -46,7 +46,6 @@ class BybitClientV5:
             result = resp.get("result") or {}
             items = result.get("list") or result.get("rows") or []
 
-            # If empty, retry without baseCoin filter
             if not items:
                 print("[BybitClientV5] No instruments found with baseCoin=USDT, retrying without filter...")
                 resp = await self._get("/v5/market/instruments-info", {"category": "linear"})
@@ -91,8 +90,14 @@ class BybitClientV5:
             parsed = []
             for k in items:
                 # Bybit returns [startTime, open, high, low, close, volume, turnover]
+                start = int(k[0]) // 1000
+                # ✅ Skip impossible timestamps (roughly <2001 or > 2033)
+                if start < 1_000_000_000 or start > 2_000_000_0000:
+                    print(f"[WARN] Skipping abnormal candle timestamp {start} for {symbol}-{interval}")
+                    continue
+
                 candle = {
-                    "open_time": int(k[0]) // 1000,
+                    "open_time": start,
                     "open": float(k[1]),
                     "high": float(k[2]),
                     "low": float(k[3]),
@@ -100,6 +105,8 @@ class BybitClientV5:
                     "volume": float(k[5]),
                 }
                 parsed.append(candle)
+
+            # Ensure chronological order
             return list(reversed(parsed))
         except Exception as e:
             print(f"[BybitClientV5] get_klines error for {symbol}-{interval}: {e}")
