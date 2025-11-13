@@ -1,246 +1,118 @@
+import aiohttp
 import asyncio
-import os
-import math
-import time
-from datetime import datetime, timezone
-from typing import List
-
-from macd import compute_macd_histogram, flipped_negative_to_positive_at_open
-from bybit_ws_client import BybitWebSocketClient
-
-TF_TO_SECONDS = {"5": 300, "15": 900, "60": 3600, "240": 14400, "1440": 86400}
+from typing import Dict, List, Optional
 
 
-class Scheduler:
-    def __init__(self, bybit_client, store, notifier, macd_params, token_bucket):
-        self.bybit = bybit_client
-        self.store = store
-        self.notifier = notifier
-        self.macd_fast, self.macd_slow, self.macd_signal = macd_params
+class BybitClientV5:
+    def __init__(self, base_url: str, token_bucket):
+        self.base_url = base_url.rstrip("/")
+        self.session: Optional[aiohttp.ClientSession] = None
         self.token_bucket = token_bucket
-        self._running = False
-        self.symbols: List[str] = []
-        self.ws_client = None
-        self.batch = int(os.getenv("BATCH_SIZE", "40"))
-        self.backfill_limit = int(os.getenv("BACKFILL_LIMIT", "200"))
-        self._task = None
-        self._scanner_task = None
-        self._trim_task = None
 
-    async def start(self):
-        await self.token_bucket.start()
-        self._running = True
+    async def _ensure_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
 
-        print("[Scheduler] Loading symbols from Bybit…")
-        self.symbols = await self.bybit.get_symbols()
-        print(f"[Scheduler] Loaded {len(self.symbols)} symbols from Bybit")
+    async def _get(self, path: str, params: Dict = None, timeout: int = 20) -> Dict:
+        """Perform safe GET request with rate limiting, retries, and JSON fallback."""
+        await self._ensure_session()
+        await self.token_bucket.consume(1)
+        url = f"{self.base_url}{path}"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; BybitBot/1.0)"}
 
-        # WebSocket client
-        self.ws_client = BybitWebSocketClient(category="linear")
-        await self.ws_client.connect()
-
-        async def on_kline(msg):
+        for attempt in range(3):
             try:
-                topic = msg.get("topic", "")
-                parts = topic.split(".")
-                if len(parts) < 3:
-                    print(f"[WS] Unexpected topic format: {topic}")
-                    return
-                _, tf, symbol = parts
-                data = msg.get("data", [])
-                if not data:
-                    return
-                k = data[0]
-                start = int(k.get("start", time.time()))
-                if start < 1_000_000_000 or start > 2_000_000_0000:
-                    print(f"[WARN] Skipping abnormal WS timestamp {start} for {symbol}-{tf}")
-                    return
+                async with self.session.get(url, params=params, headers=headers, timeout=timeout) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        print(f"[BybitClientV5] HTTP {resp.status} for {url} params={params}")
+                    try:
+                        data = await resp.json(content_type=None)
+                        return data
+                    except Exception:
+                        print(f"[BybitClientV5] Non-JSON response on attempt {attempt+1}: {text[:120]}")
+                        await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[BybitClientV5] _get error for {url}: {e}")
+                await asyncio.sleep(1)
+        return {}
+
+    async def get_symbols(self) -> List[str]:
+        """Return a list of active Linear USDT Perpetual trading pairs."""
+        out: List[str] = []
+        try:
+            params = {"category": "linear", "baseCoin": "USDT"}
+            resp = await self._get("/v5/market/instruments-info", params)
+            result = resp.get("result") or {}
+            items = result.get("list") or result.get("rows") or []
+
+            if not items:
+                print("[BybitClientV5] No instruments found with baseCoin=USDT, retrying without filter...")
+                resp = await self._get("/v5/market/instruments-info", {"category": "linear"})
+                result = resp.get("result") or {}
+                items = result.get("list") or result.get("rows") or []
+
+            clean = []
+            for it in items:
+                symbol = it.get("symbol", "")
+                quote = it.get("quoteCoin", "")
+                contract_type = it.get("contractType", "")
+                status = (it.get("status") or it.get("state") or "").lower()
+
+                if (
+                    quote == "USDT"
+                    and "perpetual" in contract_type.lower()
+                    and status == "trading"
+                    and not symbol.startswith(("100", "TEST", "BULL", "BEAR"))
+                ):
+                    clean.append(symbol)
+
+            print(f"[BybitClientV5] Fetched {len(items)} raw instruments, {len(clean)} valid USDT perpetuals.")
+            out = clean
+        except Exception as e:
+            print(f"[BybitClientV5] get_symbols error: {e}")
+            return []
+
+        return out
+
+    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
+        """Fetch historical kline data for a given symbol and timeframe."""
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": str(interval),
+            "limit": str(limit),
+        }
+        try:
+            resp = await self._get("/v5/market/kline", params)
+            result = resp.get("result") or {}
+            items = result.get("list") or []
+            parsed = []
+            for k in items:
+                # Bybit returns [startTime, open, high, low, close, volume, turnover]
+                start_raw = int(k[0])
+                start = start_raw // 1000 if start_raw > 10_000_000_000 else start_raw
+                # ✅ Skip impossible timestamps (roughly <2010 or >2035)
+                if start < 1_260_000_000 or start > 2_070_000_0000:
+                    print(f"[WARN] Skipping abnormal candle timestamp {start_raw} for {symbol}-{interval}")
+                    continue
+
                 candle = {
                     "open_time": start,
-                    "close": float(k.get("close", 0.0)),
-                    "_raw": k,
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
                 }
-                await asyncio.to_thread(self.store.save_candles, symbol, tf, [candle])
-            except Exception as e:
-                print(f"[WS] Kline callback error: {e}")
+                parsed.append(candle)
 
-        limit = int(os.getenv("WS_SYMBOL_LIMIT", "50"))
-        for sym in self.symbols[:limit]:
-            await self.ws_client.subscribe_kline(sym, "5", on_kline)
-            await self.ws_client.subscribe_kline(sym, "60", on_kline)
-
-        await self._backfill_all()
-
-        print("[Scheduler] Running initial hourly scan after backfill…")
-        await self._run_tf_check("60")
-        await self._run_tf_check("240")  # immediate 4 h check too
-
-        self._task = asyncio.create_task(self._candle_open_loops())
-        self._scanner_task = asyncio.create_task(self._five_min_scanner())
-        self._trim_task = asyncio.create_task(self._trim_loop())
-
-        print("[Scheduler] Background loops running (hourly, 5 min, trim) ✅")
-
-    async def stop(self):
-        self._running = False
-        for t in (self._task, self._scanner_task, self._trim_task):
-            if t:
-                t.cancel()
-        if self.ws_client:
-            await self.ws_client.close()
-
-    # -------------------------- Backfill and helpers ------------------------- #
-    async def _backfill_all(self):
-        tfs = [x.strip() for x in os.getenv("BACKFILL_TFS", "1440,240,60").split(",")]
-        for i in range(0, len(self.symbols), self.batch):
-            tasks = []
-            for sym in self.symbols[i:i + self.batch]:
-                for tf in tfs:
-                    tasks.append(self._fetch_and_store(sym, tf))
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(0.25)
-
-    async def _fetch_and_store(self, symbol, tf, limit=None):
-        try:
-            limit = limit or self.backfill_limit
-            klines = await self.bybit.get_klines(symbol, tf, limit=limit)
-            if klines:
-                await asyncio.to_thread(self.store.save_candles, symbol, tf, klines)
+            return list(reversed(parsed))
         except Exception as e:
-            print(f"[Scheduler] fetch_and_store error for {symbol}-{tf}: {e}")
+            print(f"[BybitClientV5] get_klines error for {symbol}-{interval}: {e}")
+            return []
 
-    async def _wait_until_next(self, seconds):
-        now = datetime.now(timezone.utc).timestamp()
-        next_ts = (math.floor(now / seconds) + 1) * seconds
-        await asyncio.sleep(max(0, next_ts - now) + 0.25)
-
-    # -------------------------- Main loops ------------------------- #
-    async def _candle_open_loops(self):
-        print("[Scheduler] Candle loop active (runs 1 h/4 h checks)")
-        while self._running:
-            try:
-                await self._run_tf_check("60")
-                now = datetime.now(timezone.utc)
-                if now.hour % 4 == 0:
-                    await self._run_tf_check("240")
-                await self._wait_until_next(TF_TO_SECONDS["60"])
-            except Exception as e:
-                print(f"[Scheduler] candle_open_loops error: {e}")
-                await asyncio.sleep(10)
-
-    async def _run_tf_check(self, tf: str):
-        print(f"[Scheduler] Running timeframe check for {tf}")
-        for i in range(0, len(self.symbols), self.batch):
-            tasks = [self._process_symbol_tf(sym, tf) for sym in self.symbols[i:i + self.batch]]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(0.25)
-
-    async def _process_symbol_tf(self, symbol: str, tf: str):
-        try:
-            klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
-            if not klines:
-                await self._fetch_and_store(symbol, tf)
-                klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
-            if not klines:
-                return
-
-            closes = [float(k["close"]) for k in klines]
-            macd_line, macd_signal, macd_hist = compute_macd_histogram(
-                closes, self.macd_fast, self.macd_slow, self.macd_signal
-            )
-            idx = len(macd_hist) - 1
-            open_ts = int(klines[-1].get("open_time", time.time()))
-            # ✅ Skip absurd timestamps
-            if open_ts < 1_000_000_000 or open_ts > 2_000_000_0000:
-                print(f"[WARN] Abnormal timestamp {open_ts} for {symbol}-{tf}, skipping this TF.")
-                return
-            flipped = flipped_negative_to_positive_at_open(macd_hist, idx)
-            if tf in ("60", "240") and flipped:
-                ts_str = datetime.utcfromtimestamp(open_ts).strftime("%Y-%m-%d %H:%M")
-                print(f"[MACD] {symbol} ({tf}) flipped positive on {ts_str} UTC")
-                ttl = TF_TO_SECONDS.get(tf, 3600)
-                meta = {
-                    "symbol": symbol,
-                    "tf": tf,
-                    "open_ts": open_ts,
-                    "expiry": open_ts + ttl,
-                    "macd_hist_open": macd_hist[idx],
-                    "last_notified": None,
-                }
-                await asyncio.to_thread(self.store.create_signal, symbol, tf, meta, ttl)
-        except Exception as e:
-            print(f"[Scheduler] process_symbol_tf error for {symbol}-{tf}: {e}")
-
-    # -------------------------- Scanning and trim loops ------------------------- #
-    async def _five_min_scanner(self):
-        while self._running:
-            await self._wait_until_next(TF_TO_SECONDS["5"])
-            print("[Scheduler] Running 5-min scan")
-            await self._scan_active_signals()
-
-    async def _scan_active_signals(self):
-        tasks = []
-        for root_tf in ["60", "240"]:
-            symbols = await asyncio.to_thread(self.store.get_active_signals, root_tf)
-            for sym in symbols:
-                tasks.append(self._check_alignment(sym, root_tf))
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    async def _check_alignment(self, symbol: str, root_tf: str):
-        try:
-            all_tfs = ["1440", "240", "60", "15", "5"]
-            tfs_to_check = [tf for tf in all_tfs if tf != root_tf]
-            root_signal = await asyncio.to_thread(self.store.get_signal, symbol, root_tf)
-            if not root_signal:
-                return
-
-            aligned = True
-            last_flipped_tf = None
-            last_flip_ts = None
-
-            for tf in tfs_to_check:
-                klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
-                if not klines:
-                    await self._fetch_and_store(symbol, tf, limit=200)
-                    klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
-                if not klines:
-                    aligned = False
-                    break
-
-                closes = [float(k["close"]) for k in klines]
-                macd_line, macd_signal, macd_hist = compute_macd_histogram(
-                    closes, self.macd_fast, self.macd_slow, self.macd_signal
-                )
-                idx = len(macd_hist) - 1
-                open_time = int(klines[-1].get("open_time", time.time()))
-                flipped = flipped_negative_to_positive_at_open(macd_hist, idx)
-
-                if flipped:
-                    last_flipped_tf = tf
-                    last_flip_ts = open_time
-                elif macd_hist[-1] <= 0:
-                    aligned = False
-                    break
-
-            if aligned and last_flipped_tf and last_flip_ts:
-                last_notified = root_signal.get("last_notified")
-                if last_notified != last_flip_ts:
-                    title = "ENTRY" if root_tf == "60" else "SIGNAL"
-                    ts_str = datetime.fromtimestamp(last_flip_ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
-                    msg = f"[{title}] {symbol} — root={root_tf} confirmed by {last_flipped_tf} flip at {ts_str} UTC"
-                    print(f"[ALERT] {msg}")
-                    await self.notifier.send(msg)
-                    await asyncio.to_thread(self.store.set_last_notified, symbol, root_tf, last_flip_ts)
-        except Exception as e:
-            print(f"[Scheduler] check_alignment error for {symbol}-{root_tf}: {e}")
-
-    async def _trim_loop(self):
-        interval = int(os.getenv("TRIM_INTERVAL_MINUTES", "60")) * 60
-        while self._running:
-            try:
-                await asyncio.to_thread(self.store.trim_all)
-                print("[Scheduler] Trimmed old data ✅")
-            except Exception as e:
-                print(f"[Scheduler] trim_loop error: {e}")
-            await asyncio.sleep(interval)
+    async def close(self):
+        """Close aiohttp session."""
+        if self.session and not self.session.closed:
+            await self.session.close()
