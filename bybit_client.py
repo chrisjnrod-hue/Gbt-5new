@@ -14,22 +14,31 @@ class BybitClientV5:
             self.session = aiohttp.ClientSession()
 
     async def _get(self, path: str, params: Dict = None, timeout: int = 20) -> Dict:
-        """Generic GET request with rate limiting."""
+        """Perform safe GET request with rate limiting, retries, and JSON fallback."""
         await self._ensure_session()
         await self.token_bucket.consume(1)
         url = f"{self.base_url}{path}"
-        try:
-            async with self.session.get(url, params=params, timeout=timeout) as resp:
-                data = await resp.json(content_type=None)
-                if resp.status != 200:
-                    print(f"[BybitClientV5] HTTP {resp.status} for {url} params={params}")
-                return data
-        except Exception as e:
-            print(f"[BybitClientV5] _get error for {url}: {e}")
-            return {}
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; BybitBot/1.0)"}
+
+        for attempt in range(3):
+            try:
+                async with self.session.get(url, params=params, headers=headers, timeout=timeout) as resp:
+                    text = await resp.text()
+                    if resp.status != 200:
+                        print(f"[BybitClientV5] HTTP {resp.status} for {url} params={params}")
+                    try:
+                        data = await resp.json(content_type=None)
+                        return data
+                    except Exception:
+                        print(f"[BybitClientV5] Non-JSON response on attempt {attempt+1}: {text[:120]}")
+                        await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[BybitClientV5] _get error for {url}: {e}")
+                await asyncio.sleep(1)
+        return {}
 
     async def get_symbols(self) -> List[str]:
-        """Return a list of active linear USDT symbols."""
+        """Return a list of active Linear USDT Perpetual trading pairs."""
         out: List[str] = []
         try:
             params = {"category": "linear", "baseCoin": "USDT"}
@@ -37,25 +46,30 @@ class BybitClientV5:
             result = resp.get("result") or {}
             items = result.get("list") or result.get("rows") or []
 
-            # If no items returned, retry without baseCoin filter
+            # If empty, retry without baseCoin filter
             if not items:
                 print("[BybitClientV5] No instruments found with baseCoin=USDT, retrying without filter...")
                 resp = await self._get("/v5/market/instruments-info", {"category": "linear"})
                 result = resp.get("result") or {}
                 items = result.get("list") or result.get("rows") or []
 
-            print(f"[BybitClientV5] Fetched {len(items)} instruments from Bybit.")
-
+            clean = []
             for it in items:
-                symbol = it.get("symbol") or it.get("name")
-                quote = it.get("quote_currency") or it.get("quoteCoin") or it.get("quote")
-                status = it.get("status") or it.get("state") or it.get("status_code")
-                if not symbol:
-                    continue
-                if quote and quote.upper() == "USDT" and (not status or str(status).lower() in ("trading", "active", "list")):
-                    out.append(symbol)
+                symbol = it.get("symbol", "")
+                quote = it.get("quoteCoin", "")
+                contract_type = it.get("contractType", "")
+                status = (it.get("status") or it.get("state") or "").lower()
 
-            print(f"[BybitClientV5] Parsed {len(out)} active USDT symbols.")
+                if (
+                    quote == "USDT"
+                    and "perpetual" in contract_type.lower()
+                    and status == "trading"
+                    and not symbol.startswith(("100", "TEST", "BULL", "BEAR"))
+                ):
+                    clean.append(symbol)
+
+            print(f"[BybitClientV5] Fetched {len(items)} raw instruments, {len(clean)} valid USDT perpetuals.")
+            out = clean
         except Exception as e:
             print(f"[BybitClientV5] get_symbols error: {e}")
             return []
@@ -63,7 +77,7 @@ class BybitClientV5:
         return out
 
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
-        """Fetch kline (candlestick) data for a symbol and interval."""
+        """Fetch historical kline data for a given symbol and timeframe."""
         params = {
             "category": "linear",
             "symbol": symbol,
