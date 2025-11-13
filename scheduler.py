@@ -6,15 +6,9 @@ from datetime import datetime, timezone
 from typing import List
 
 from macd import compute_macd_histogram, flipped_negative_to_positive_at_open
-from bybit_ws_client import BybitWebSocketClient  # ✅ New import
+from bybit_ws_client import BybitWebSocketClient  # ✅ WebSocket
+TF_TO_SECONDS = {"5": 5 * 60, "15": 15 * 60, "60": 60 * 60, "240": 4 * 60 * 60, "1440": 24 * 60 * 60}
 
-TF_TO_SECONDS = {
-    "5": 5 * 60,
-    "15": 15 * 60,
-    "60": 60 * 60,
-    "240": 4 * 60 * 60,
-    "1440": 24 * 60 * 60,
-}
 
 class Scheduler:
     def __init__(self, bybit_client, store, notifier, macd_params, token_bucket):
@@ -28,19 +22,20 @@ class Scheduler:
         self._task = None
         self._scanner_task = None
         self._trim_task = None
-        self.ws_client = None  # ✅ New
+        self.ws_client = None  # ✅ New WebSocket client
 
         self.batch = int(os.getenv("BATCH_SIZE", "40"))
         self.backfill_limit = int(os.getenv("BACKFILL_LIMIT", "200"))
 
     async def start(self):
+        """Starts the scheduler, websocket, and background loops."""
         await self.token_bucket.start()
         self._running = True
         print("[Scheduler] Loading symbols from Bybit...")
         self.symbols = await self.bybit.get_symbols()
         print(f"[Scheduler] Loaded {len(self.symbols)} symbols from Bybit")
 
-        # --- ✅ Start WebSocket client ---
+        # ✅ Start WebSocket client
         self.ws_client = BybitWebSocketClient(category="linear")
         await self.ws_client.connect()
 
@@ -58,16 +53,20 @@ class Scheduler:
             except Exception as e:
                 print(f"[WS] Kline callback error: {e}")
 
-        # Subscribe to 5-min and 60-min updates (you can add more intervals)
-        subscribe_limit = int(os.getenv("WS_SYMBOL_LIMIT", "50"))  # optional limit
+        # ✅ Limit WebSocket subscriptions for testing
+        subscribe_limit = int(os.getenv("WS_SYMBOL_LIMIT", "50"))
         for sym in self.symbols[:subscribe_limit]:
             await self.ws_client.subscribe_kline(sym, "5", on_kline)
             await self.ws_client.subscribe_kline(sym, "60", on_kline)
 
-        # --- Backfill old data once ---
+        # ✅ Backfill once on startup
         await self._backfill_all()
 
-        # --- Start background loops ---
+        # ✅ Run initial scan right after backfill
+        print("[Scheduler] Running initial hourly scan immediately after backfill...")
+        await self._run_tf_check("60")
+
+        # ✅ Launch background loops
         self._task = asyncio.create_task(self._candle_open_loops())
         self._scanner_task = asyncio.create_task(self._five_min_scanner())
         self._trim_task = asyncio.create_task(self._trim_loop())
@@ -76,6 +75,7 @@ class Scheduler:
         print("[Scheduler] Entered candle open loop")
 
     async def stop(self):
+        """Stop scheduler gracefully."""
         self._running = False
         for t in (self._task, self._scanner_task, self._trim_task):
             if t:
@@ -96,16 +96,17 @@ class Scheduler:
             await asyncio.sleep(0.2)
 
     async def _fetch_and_store(self, symbol, tf, limit=None):
-        """Still uses REST for backfill / missing candles."""
+        """Fetch and store candles from REST API."""
         try:
             limit = limit or self.backfill_limit
             klines = await self.bybit.get_klines(symbol, tf, limit=limit)
             if klines:
                 await asyncio.to_thread(self.store.save_candles, symbol, tf, klines)
-        except Exception:
-            return
+        except Exception as e:
+            print(f"[Scheduler] fetch_and_store error for {symbol}-{tf}: {e}")
 
     async def _wait_until_next(self, period_seconds: int):
+        """Sleep until the next candle open boundary."""
         now = datetime.now(timezone.utc)
         now_ts = now.timestamp()
         next_ts = (math.floor(now_ts / period_seconds) + 1) * period_seconds
@@ -113,15 +114,28 @@ class Scheduler:
         await asyncio.sleep(wait + 0.25)
 
     async def _candle_open_loops(self):
-        """Main hourly + 4-hourly loop (unchanged)."""
+        """Main hourly + 4-hourly loop."""
+        print("[Scheduler] Candle loop started (first run immediately)")
         while self._running:
-            await self._wait_until_next(TF_TO_SECONDS["60"])
-            await self._run_tf_check("60")
-            now = datetime.now(timezone.utc)
-            if now.hour % 4 == 0:
-                await self._run_tf_check("240")
+            try:
+                # ✅ Run hourly check immediately
+                print("[Scheduler] Running timeframe check for 60")
+                await self._run_tf_check("60")
+
+                now = datetime.now(timezone.utc)
+                if now.hour % 4 == 0:
+                    print("[Scheduler] Running timeframe check for 240 (4-hour)")
+                    await self._run_tf_check("240")
+
+                # ✅ Then wait until next hourly candle open
+                await self._wait_until_next(TF_TO_SECONDS["60"])
+            except Exception as e:
+                print(f"[Scheduler] Candle loop error: {e}")
+                await asyncio.sleep(10)
 
     async def _run_tf_check(self, tf: str):
+        """Run MACD analysis for all symbols at given timeframe."""
+        print(f"[Scheduler] Starting TF check for {tf} across {len(self.symbols)} symbols")
         batch = self.batch
         for i in range(0, len(self.symbols), batch):
             tasks = [self._process_symbol_tf(sym, tf) for sym in self.symbols[i:i + batch]]
@@ -129,7 +143,7 @@ class Scheduler:
             await asyncio.sleep(0.2)
 
     async def _process_symbol_tf(self, symbol: str, tf: str):
-        """Unchanged MACD check logic."""
+        """Perform MACD signal checks."""
         try:
             klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
             if not klines:
@@ -137,10 +151,12 @@ class Scheduler:
                 klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
             if not klines:
                 return
+
             closes = [float(k["close"]) for k in klines]
             macd_line, macd_signal, macd_hist = compute_macd_histogram(
                 closes, self.macd_fast, self.macd_slow, self.macd_signal
             )
+
             open_index = len(macd_hist) - 1
             if flipped_negative_to_positive_at_open(macd_hist, open_index):
                 ttl = TF_TO_SECONDS.get(tf, 3600)
@@ -153,20 +169,18 @@ class Scheduler:
                     "last_notified": None,
                 }
                 await asyncio.to_thread(self.store.create_signal, symbol, tf, meta, ttl)
-                for lazy_tf in os.getenv("LAZY_TFS", "5,15").split(","):
-                    lazy_tf = lazy_tf.strip()
-                    if lazy_tf:
-                        await self._fetch_and_store(symbol, lazy_tf, limit=200)
-        except Exception:
-            return
+        except Exception as e:
+            print(f"[Scheduler] process_symbol_tf error for {symbol}-{tf}: {e}")
 
     async def _five_min_scanner(self):
         """Loop for short-term alignment scanning."""
         while self._running:
             await self._wait_until_next(TF_TO_SECONDS["5"])
+            print("[Scheduler] Running 5-min alignment scan")
             await self._scan_active_signals()
 
     async def _scan_active_signals(self):
+        """Check for active signal alignment across timeframes."""
         tasks = []
         for root_tf in ["60", "240"]:
             symbols = await asyncio.to_thread(self.store.get_active_signals, root_tf)
@@ -176,7 +190,7 @@ class Scheduler:
             await asyncio.gather(*tasks)
 
     async def _check_alignment(self, symbol: str, root_tf: str):
-        """Unchanged alignment + notification logic."""
+        """Alignment and Telegram alert logic."""
         try:
             required = ["1440", "15", "5"]
             if root_tf == "60":
@@ -186,6 +200,7 @@ class Scheduler:
             aligned = True
             last_flipped_tf = None
             last_flip_ts = None
+
             for tf in required:
                 klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
                 if not klines:
@@ -194,6 +209,7 @@ class Scheduler:
                 if not klines:
                     aligned = False
                     break
+
                 closes = [float(k["close"]) for k in klines]
                 macd_line, macd_signal, macd_hist = compute_macd_histogram(
                     closes, self.macd_fast, self.macd_slow, self.macd_signal
@@ -206,6 +222,7 @@ class Scheduler:
                     open_time = int(klines[-1]["open_time"]) if klines[-1].get("open_time") else int(time.time())
                     last_flipped_tf = tf
                     last_flip_ts = open_time
+
             if aligned:
                 sig = await asyncio.to_thread(self.store.get_signal, symbol, root_tf)
                 last_notified = sig.get("last_notified") if sig else None
@@ -218,15 +235,16 @@ class Scheduler:
                     msg = f"[{title}] {symbol} — root={root_tf} aligned on open {ts_str} UTC. last flipped timeframe: {last_flipped_tf}"
                     await self.notifier.send(msg)
                     await asyncio.to_thread(self.store.set_last_notified, symbol, root_tf, last_flip_ts)
-        except Exception:
-            return
+        except Exception as e:
+            print(f"[Scheduler] check_alignment error for {symbol}-{root_tf}: {e}")
 
     async def _trim_loop(self):
-        """Regular cleanup task."""
+        """Periodic cleanup of old signals and data."""
         interval = int(os.getenv("TRIM_INTERVAL_MINUTES", "60")) * 60
         while self._running:
             try:
                 await asyncio.to_thread(self.store.trim_all)
-            except Exception:
-                pass
+                print("[Scheduler] Trimmed old data ✅")
+            except Exception as e:
+                print(f"[Scheduler] trim_loop error: {e}")
             await asyncio.sleep(interval)
