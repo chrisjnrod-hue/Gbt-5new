@@ -32,10 +32,16 @@ class Scheduler:
         self.backfill_limit = int(os.getenv("BACKFILL_LIMIT", "200"))
 
     async def start(self):
+        print("[Scheduler] Starting scheduler...")
         await self.token_bucket.start()
         self._running = True
+
         self.symbols = await self.bybit.get_symbols()
+        print(f"[Scheduler] Loaded {len(self.symbols)} symbols from Bybit")
+
         await self._backfill_all()
+        print("[Scheduler] Launching background loops (hourly, 5min, trim)")
+
         self._task = asyncio.create_task(self._candle_open_loops())
         self._scanner_task = asyncio.create_task(self._five_min_scanner())
         self._trim_task = asyncio.create_task(self._trim_loop())
@@ -74,6 +80,7 @@ class Scheduler:
         await asyncio.sleep(wait + 0.25)
 
     async def _candle_open_loops(self):
+        print("[Scheduler] Entered candle open loop")
         while self._running:
             await self._wait_until_next(TF_TO_SECONDS["60"])
             await self._run_tf_check("60")
@@ -97,7 +104,9 @@ class Scheduler:
             if not klines:
                 return
             closes = [float(k["close"]) for k in klines]
-            macd_line, macd_signal, macd_hist = compute_macd_histogram(closes, self.macd_fast, self.macd_slow, self.macd_signal)
+            macd_line, macd_signal, macd_hist = compute_macd_histogram(
+                closes, self.macd_fast, self.macd_slow, self.macd_signal
+            )
             open_index = len(macd_hist) - 1
             if flipped_negative_to_positive_at_open(macd_hist, open_index):
                 ttl = TF_TO_SECONDS.get(tf, 3600)
@@ -107,10 +116,10 @@ class Scheduler:
                     "open_ts": int(time.time()),
                     "expiry": int(time.time()) + ttl,
                     "macd_hist_open": macd_hist[open_index],
-                    "last_notified": None
+                    "last_notified": None,
                 }
                 await asyncio.to_thread(self.store.create_signal, symbol, tf, meta, ttl)
-                for lazy_tf in (os.getenv("LAZY_TFS", "5,15").split(",")):
+                for lazy_tf in os.getenv("LAZY_TFS", "5,15").split(","):
                     lazy_tf = lazy_tf.strip()
                     if lazy_tf:
                         await self._fetch_and_store(symbol, lazy_tf, limit=200)
@@ -150,13 +159,19 @@ class Scheduler:
                     aligned = False
                     break
                 closes = [float(k["close"]) for k in klines]
-                macd_line, macd_signal, macd_hist = compute_macd_histogram(closes, self.macd_fast, self.macd_slow, self.macd_signal)
+                macd_line, macd_signal, macd_hist = compute_macd_histogram(
+                    closes, self.macd_fast, self.macd_slow, self.macd_signal
+                )
                 idx = len(macd_hist) - 1
                 if not flipped_negative_to_positive_at_open(macd_hist, idx):
                     aligned = False
                     break
                 else:
-                    open_time = int(klines[-1]["open_time"]) if klines[-1].get("open_time") else int(time.time())
+                    open_time = (
+                        int(klines[-1]["open_time"])
+                        if klines[-1].get("open_time")
+                        else int(time.time())
+                    )
                     last_flipped_tf = tf
                     last_flip_ts = open_time
             if aligned:
@@ -165,12 +180,16 @@ class Scheduler:
                 if last_notified != last_flip_ts:
                     sig60 = await asyncio.to_thread(self.store.get_signal, symbol, "60")
                     sig240 = await asyncio.to_thread(self.store.get_signal, symbol, "240")
-                    is_super = (sig60 is not None and root_tf == "240") or (sig240 is not None and root_tf == "60")
+                    is_super = (sig60 is not None and root_tf == "240") or (
+                        sig240 is not None and root_tf == "60"
+                    )
                     title = "SUPER" if is_super else "ALIGNED"
                     ts_str = datetime.fromtimestamp(last_flip_ts, timezone.utc).isoformat()
                     msg = f"[{title}] {symbol} — root={root_tf} aligned on open {ts_str} UTC. last flipped timeframe: {last_flipped_tf}"
                     await self.notifier.send(msg)
-                    await asyncio.to_thread(self.store.set_last_notified, symbol, root_tf, last_flip_ts)
+                    await asyncio.to_thread(
+                        self.store.set_last_notified, symbol, root_tf, last_flip_ts
+                    )
         except Exception:
             return
 
