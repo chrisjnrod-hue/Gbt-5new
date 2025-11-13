@@ -30,6 +30,7 @@ class Scheduler:
         self._trim_task = None
 
     async def start(self):
+        """Initialize scheduler, backfill data, send hello, and launch loops."""
         await self.token_bucket.start()
         self._running = True
         print("[Scheduler] Loading symbols from Bybit…")
@@ -46,7 +47,6 @@ class Scheduler:
                 topic = msg.get("topic", "")
                 parts = topic.split(".")
                 if len(parts) < 3:
-                    print(f"[WS] Unexpected topic format: {topic}")
                     return
                 _, tf, symbol = parts
                 data = msg.get("data", [])
@@ -56,14 +56,13 @@ class Scheduler:
                 start_raw = int(k.get("start", time.time()))
                 start = start_raw // 1000 if start_raw > 10_000_000_000 else start_raw
                 if start < 1_260_000_000 or start > 2_070_000_0000:
-                    print(f"[WARN] Skipping truly abnormal WS timestamp {start_raw} for {symbol}-{tf}")
                     return
-                candle = {"open_time": start, "close": float(k.get("close", 0.0)), "_raw": k}
+                candle = {"open_time": start, "close": float(k.get("close", 0.0))}
                 await asyncio.to_thread(self.store.save_candles, symbol, tf, [candle])
             except Exception as e:
                 print(f"[WS] Kline callback error: {e}")
 
-        # Subscribe
+        # Subscribe (limit to avoid WS overload)
         limit = int(os.getenv("WS_SYMBOL_LIMIT", "50"))
         for sym in self.symbols[:limit]:
             await self.ws_client.subscribe_kline(sym, "5", on_kline)
@@ -75,11 +74,17 @@ class Scheduler:
         await self._run_tf_check("60")
         await self._run_tf_check("240")
 
-        # Start loops
+        # ✅ Telegram Hello message
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        hello_msg = f"🤖 Scheduler started successfully — system live and ready to scan! ({ts})"
+        print("[Scheduler] Sending startup hello message…")
+        await self.notifier.send(hello_msg)
+
+        # Launch background loops
         self._task = asyncio.create_task(self._candle_open_loops())
         self._scanner_task = asyncio.create_task(self._five_min_scanner())
         self._trim_task = asyncio.create_task(self._trim_loop())
-        print("[Scheduler] Background loops running (hourly, 5min, trim) ✅")
+        print("[Scheduler] Background loops running (hourly, 5 min, trim) ✅")
 
     async def stop(self):
         self._running = False
@@ -113,15 +118,16 @@ class Scheduler:
         next_ts = (math.floor(now / seconds) + 1) * seconds
         await asyncio.sleep(max(0, next_ts - now) + 0.25)
 
+    # --- Correct hourly / 4h candle-open loop
     async def _candle_open_loops(self):
-        print("[Scheduler] Candle loop active (runs 1h/4h checks)")
+        print("[Scheduler] Candle loop active (runs 1 h / 4 h checks)")
         while self._running:
             try:
+                await self._wait_until_next(TF_TO_SECONDS["60"])
                 await self._run_tf_check("60")
                 now = datetime.now(timezone.utc)
                 if now.hour % 4 == 0:
                     await self._run_tf_check("240")
-                await self._wait_until_next(TF_TO_SECONDS["60"])
             except Exception as e:
                 print(f"[Scheduler] candle_open_loops error: {e}")
                 await asyncio.sleep(10)
@@ -134,6 +140,7 @@ class Scheduler:
             await asyncio.sleep(0.25)
 
     async def _process_symbol_tf(self, symbol: str, tf: str):
+        """Compute MACD and detect flips for root timeframes."""
         try:
             klines = await asyncio.to_thread(self.store.get_candles, symbol, tf)
             if not klines:
@@ -149,7 +156,6 @@ class Scheduler:
             idx = len(macd_hist) - 1
             open_ts = int(klines[-1].get("open_time", time.time()))
             if open_ts < 1_260_000_000 or open_ts > 2_070_000_0000:
-                print(f"[WARN] Abnormal timestamp {open_ts} for {symbol}-{tf}, skipping this TF.")
                 return
 
             flipped = flipped_negative_to_positive_at_open(macd_hist, idx)
@@ -169,10 +175,11 @@ class Scheduler:
         except Exception as e:
             print(f"[Scheduler] process_symbol_tf error for {symbol}-{tf}: {e}")
 
+    # --- 5 min alignment loop
     async def _five_min_scanner(self):
         while self._running:
             await self._wait_until_next(TF_TO_SECONDS["5"])
-            print("[Scheduler] Running 5-min scan")
+            print("[Scheduler] Running 5 min scan")
             await self._scan_active_signals()
 
     async def _scan_active_signals(self):
@@ -185,6 +192,7 @@ class Scheduler:
             await asyncio.gather(*tasks)
 
     async def _check_alignment(self, symbol: str, root_tf: str):
+        """Confirm entry when smaller TF flips positive after root signal."""
         try:
             all_tfs = ["1440", "240", "60", "15", "5"]
             tfs_to_check = [tf for tf in all_tfs if tf != root_tf]
@@ -213,19 +221,29 @@ class Scheduler:
                 open_time = int(klines[-1].get("open_time", time.time()))
                 flipped = flipped_negative_to_positive_at_open(macd_hist, idx)
 
+                # strategy: smaller TFs just need positive hist;
+                # only latest flip is confirmation
+                if macd_hist[-1] <= 0:
+                    aligned = False
+                    break
                 if flipped:
                     last_flipped_tf = tf
                     last_flip_ts = open_time
-                elif macd_hist[-1] <= 0:
-                    aligned = False
-                    break
 
-            if aligned and last_flipped_tf and last_flip_ts:
+            if (
+                aligned
+                and last_flipped_tf
+                and last_flip_ts
+                and last_flip_ts > root_signal.get("open_ts", 0)
+            ):
                 last_notified = root_signal.get("last_notified")
                 if last_notified != last_flip_ts:
                     title = "ENTRY" if root_tf == "60" else "SIGNAL"
                     ts_str = datetime.fromtimestamp(last_flip_ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
-                    msg = f"[{title}] {symbol} — root={root_tf} confirmed by {last_flipped_tf} flip at {ts_str} UTC"
+                    msg = (
+                        f"[{title}] {symbol} — root={root_tf} confirmed by "
+                        f"{last_flipped_tf} flip at {ts_str} UTC"
+                    )
                     print(f"[ALERT] {msg}")
                     await self.notifier.send(msg)
                     await asyncio.to_thread(self.store.set_last_notified, symbol, root_tf, last_flip_ts)
