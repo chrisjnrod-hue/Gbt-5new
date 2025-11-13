@@ -64,3 +64,12 @@ async def health(x_cron_secret: Optional[str] = Header(None)):
         if not x_cron_secret or x_cron_secret != CRON_SECRET:
             raise HTTPException(status_code=403, detail="Forbidden")
     return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    """
+    Basic root route for Render health checks and uptime pingers.
+    Returns 200 OK so the app stays awake.
+    """
+    return {"status": "ok", "message": "service running"}
+
