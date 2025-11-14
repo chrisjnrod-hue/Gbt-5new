@@ -1,155 +1,131 @@
 # bybit_ws_client.py
 import asyncio
-import aiohttp
 import json
-import time
-from typing import Callable, Dict, Optional
+import traceback
+import websockets
+from typing import Callable
+
+WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 class BybitWebSocketClient:
-    """
-    WebSocket client for Bybit V5 public streams (linear).
-    - subscribe_kline(symbol, interval, callback): subscribe and register callback
-    - unsubscribe_kline(symbol, interval): unsubscribe and remove callback
-    """
-
-    def __init__(self, category: str = "linear", reconnect_delay: float = 3.0):
+    def __init__(self, category="linear"):
         self.category = category
-        self.url = f"wss://stream.bybit.com/v5/public/{category}"
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        # topic -> callback coroutine
-        self.callbacks: Dict[str, Callable] = {}
-        # track active topics
-        self.topics: set = set()
-        self._listen_task: Optional[asyncio.Task] = None
-        self._running = False
-        self.reconnect_delay = reconnect_delay
+        self.ws = None
+        self._connected = False
         self._lock = asyncio.Lock()
 
-    # -------------------- Connection -------------------- #
+        # topic -> callback
+        self._topic_handlers = {}
+
+    # --------------------------
+    # Connect
+    # --------------------------
     async def connect(self):
         async with self._lock:
-            if self.ws and not self.ws.closed:
+            if self._connected:
                 return
-            if self.session is None:
-                self.session = aiohttp.ClientSession()
-            # try to connect
-            try:
-                self.ws = await self.session.ws_connect(self.url, heartbeat=20)
-                self._running = True
-                # start listen loop
-                if not self._listen_task or self._listen_task.done():
-                    self._listen_task = asyncio.create_task(self._listen())
-                print(f"[WS] Connected to {self.url}")
-            except Exception as e:
-                print(f"[WS] Connect error: {e}")
-                self._running = False
-                # do not raise; caller can retry
+
+            print(f"[WS] Connecting to {WS_URL} ...")
+            self.ws = await websockets.connect(
+                WS_URL, ping_interval=20, ping_timeout=20
+            )
+            self._connected = True
+            asyncio.create_task(self._reader())
+            print("[WS] Connected OK")
 
     async def close(self):
-        self._running = False
-        if self.ws and not self.ws.closed:
-            try:
+        async with self._lock:
+            if self.ws:
                 await self.ws.close()
-            except Exception:
-                pass
-        if self.session:
-            try:
-                await self.session.close()
-            except Exception:
-                pass
-        print("[WS] Closed connection")
+            self._connected = False
 
-    # -------------------- Subscribe / Unsubscribe -------------------- #
-    async def subscribe_kline(self, symbol: str, interval: str, callback):
-        """
-        Subscribe to kline.{interval}.{symbol} and register callback.
-        callback receives the raw message dict (the JSON object received from server).
-        """
+    # --------------------------
+    # Subscribe / Unsubscribe
+    # --------------------------
+    async def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
         topic = f"kline.{interval}.{symbol}"
-        # ensure connection
-        if not self.ws or self.ws.closed:
-            await self.connect()
-            # small wait to stabilize
-            await asyncio.sleep(0.05)
 
-        msg = {"op": "subscribe", "args": [topic]}
-        try:
-            await self.ws.send_json(msg)
-            # register callback immediately (even if ack not arrived)
-            self.callbacks[topic] = callback
-            self.topics.add(topic)
-            print(f"[WS] Subscribed to {topic}")
-        except Exception as e:
-            print(f"[WS] subscribe_kline error for {topic}: {e}")
-            raise
+        if topic in self._topic_handlers:
+            return
+
+        await self._send({
+            "op": "subscribe",
+            "args": [topic]
+        })
+
+        self._topic_handlers[topic] = callback
+        print(f"[WS] Subscribed to {topic}")
 
     async def unsubscribe_kline(self, symbol: str, interval: str):
-        """
-        Unsubscribe from kline.{interval}.{symbol}. Safe if subscription not present.
-        """
         topic = f"kline.{interval}.{symbol}"
-        if not self.ws or self.ws.closed:
-            # still attempt to connect so unsubscribe can be sent; if not, just cleanup locally
-            try:
-                await self.connect()
-            except Exception:
-                pass
 
-        msg = {"op": "unsubscribe", "args": [topic]}
+        if topic not in self._topic_handlers:
+            return
+
+        await self._send({
+            "op": "unsubscribe",
+            "args": [topic]
+        })
+
+        self._topic_handlers.pop(topic, None)
+        print(f"[WS] Unsubscribed from {topic}")
+
+    # --------------------------
+    # Internal Send
+    # --------------------------
+    async def _send(self, payload: dict):
+        if not self._connected:
+            await self.connect()
+
         try:
-            # send unsubscribe; ignore failures
-            await self.ws.send_json(msg)
-            print(f"[WS] Unsubscribed from {topic}")
-        except Exception as e:
-            print(f"[WS] unsubscribe_kline send error for {topic}: {e}")
+            await self.ws.send(json.dumps(payload))
+        except Exception:
+            traceback.print_exc()
+            self._connected = False
+            await asyncio.sleep(1)
+            await self.connect()
+            await self.ws.send(json.dumps(payload))
 
-        # remove callback registration locally
-        if topic in self.callbacks:
-            del self.callbacks[topic]
-        if topic in self.topics:
-            self.topics.discard(topic)
-
-    # -------------------- Listen loop -------------------- #
-    async def _listen(self):
-        """Listen for incoming WS messages, dispatch to callbacks, and auto-reconnect."""
+    # --------------------------
+    # Reader Loop
+    # --------------------------
+    async def _reader(self):
         while True:
             try:
-                if not self.ws:
-                    await asyncio.sleep(self.reconnect_delay)
-                    await self.connect()
-                    continue
+                msg = await self.ws.recv()
+                data = json.loads(msg)
 
-                async for msg in self.ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            data = json.loads(msg.data)
-                        except Exception:
-                            continue
+                topic = data.get("topic")
+                if topic in self._topic_handlers:
+                    cb = self._topic_handlers[topic]
 
-                        # direct heartbeat / system messages may not have 'topic'
-                        topic = data.get("topic")
-                        # dispatch only when topic exists and registered callback exists
-                        if topic and topic in self.callbacks and "data" in data:
-                            cb = self.callbacks.get(topic)
-                            # call callback but do not await blocking the loop
-                            try:
-                                # ensure callback is awaited (it is an async fn)
-                                asyncio.create_task(cb(data))
-                            except Exception as e:
-                                print(f"[WS] Callback dispatch error for {topic}: {e}")
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        print(f"[WS] WSMsgType.ERROR: {msg.data}")
-                        break
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        print("[WS] WebSocket CLOSED")
-                        break
-            except Exception as e:
-                print(f"[WS] Listen loop exception: {e}")
-            # if loop exits, attempt reconnect after delay
-            try:
-                await asyncio.sleep(self.reconnect_delay)
+                    raw = data.get("data")
+                    if not raw:
+                        continue
+
+                    if isinstance(raw, list):
+                        item = raw[0]
+                    else:
+                        item = raw
+
+                    normalized = {
+                        "symbol": item.get("symbol"),
+                        "interval": item.get("interval") or item.get("period"),
+                        "start": int(item.get("start") or item.get("t") or 0),
+                        "close": float(item.get("close") or item.get("c") or 0),
+                    }
+
+                    try:
+                        await cb({"data": [normalized]})
+                    except Exception:
+                        traceback.print_exc()
+
+            except websockets.exceptions.ConnectionClosed:
+                print("[WS] Connection closed. Reconnecting...")
+                self._connected = False
+                await asyncio.sleep(1)
                 await self.connect()
-            except Exception as e:
-                print(f"[WS] Reconnect attempt failed: {e}")
-                await asyncio.sleep(self.reconnect_delay)
+
+            except Exception:
+                traceback.print_exc()
+                await asyncio.sleep(0.25)
