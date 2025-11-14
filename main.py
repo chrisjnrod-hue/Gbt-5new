@@ -1,86 +1,52 @@
-import os
-import asyncio
-from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
-from typing import Optional
+# main.py (FINAL)
 
-from rate_limiter import TokenBucket
-from notifier import TelegramNotifier
+import os
+from fastapi import FastAPI
+from dotenv import load_dotenv
+
 from scheduler import Scheduler
-from bybit_client import BybitClientV5
-from store_sqlite import SQLiteStore
+from rate_limiter import TokenBucket
 
 load_dotenv()
 
-SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "data.db")
-BYBIT_REST_BASE = os.getenv("BYBIT_REST_BASE", "https://api.bybit.com")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REST_MAX_TOKENS = int(os.getenv("REST_MAX_TOKENS", "500"))
 REST_REFILL_SECONDS = float(os.getenv("REST_REFILL_SECONDS", "7"))
-MACD_FAST = int(os.getenv("MACD_FAST", "12"))
-MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
-MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
-CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 app = FastAPI()
 
-store = SQLiteStore(SQLITE_DB_PATH)
+# Token bucket is optional, used only for REST backfill
 token_bucket = TokenBucket(capacity=REST_MAX_TOKENS, refill_interval=REST_REFILL_SECONDS)
-bybit = BybitClientV5(BYBIT_REST_BASE, token_bucket)
-notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-scheduler = Scheduler(bybit, store, notifier, (MACD_FAST, MACD_SLOW, MACD_SIGNAL), token_bucket)
 
+# New scheduler (self-contained)
+scheduler = Scheduler()
 
 @app.on_event("startup")
 async def startup_event():
     print("[Main] Starting token bucket...")
     await token_bucket.start()
 
-    # ✅ Run scheduler in the background so FastAPI can start immediately
-    asyncio.create_task(scheduler.start())
-    print("[Main] Scheduler launched in background ✅")
+    print("[Main] Starting scheduler...")
+    await scheduler.start()
 
-    # optional: run a light backfill in background too
-    asyncio.create_task(_safe_backfill())
-
-
-async def _safe_backfill():
-    """Run a backfill after startup without blocking the API."""
-    try:
-        await asyncio.sleep(3)
-        await scheduler._backfill_all()
-        print("[Main] Backfill task completed ✅")
-    except Exception as e:
-        print(f"[Main] Backfill failed: {e}")
-
+    print("[Main] Scheduler launched in background ✔")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("[Main] Shutting down...")
+    print("[Main] Shutting down scheduler...")
     try:
-        await scheduler.stop()
-    except Exception as e:
-        print(f"[Main] Error stopping scheduler: {e}")
-    try:
-        await bybit.close()
-    except Exception:
+        await scheduler.ws.close()
+    except:
         pass
-    try:
-        await notifier.close()
-    except Exception:
-        pass
-    print("[Main] Shutdown complete ✅")
 
+    try:
+        await token_bucket.stop()
+    except:
+        pass
 
 @app.get("/health")
-async def health(x_cron_secret: Optional[str] = Header(None)):
-    if CRON_SECRET:
-        if not x_cron_secret or x_cron_secret != CRON_SECRET:
-            raise HTTPException(status_code=403, detail="Forbidden")
+async def health():
     return {"status": "ok"}
-
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"status": "ok", "message": "service running"}
+    return {"status": "ok", "service": "running"}
