@@ -1,7 +1,5 @@
-# ============================================================
-# scheduler.py  — FULL, FINAL VERSION
-# ============================================================
-
+# scheduler.py
+"""Scheduler for processing market data, detecting MACD flips, and managing signals and subscriptions."""
 import asyncio
 import time
 import os
@@ -13,19 +11,8 @@ from bybit_ws_client import BybitWebSocketClient
 from bybit_client import BybitClientV5
 from notifier import Notifier
 
-
-# Convert milliseconds → datetime
-def ts_to_dt(ts_ms: int):
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-
-
-# ============================================================
-#                    SCHEDULER CLASS
-# ============================================================
-
 class Scheduler:
     def __init__(self):
-
         # Core components
         self.store = Store("market.db")
         self.rest = BybitClientV5()
@@ -45,12 +32,10 @@ class Scheduler:
         self._tf_loop_task = None
         self._ws_manager_task = None
 
-
     # ========================================================
     # STARTUP
     # ========================================================
     async def start(self):
-
         # Connect WS first (persistent connection)
         await self.ws.connect()
 
@@ -59,7 +44,7 @@ class Scheduler:
         self.symbols = syms
         print(f"[Scheduler] Loaded {len(self.symbols)} symbols.")
 
-        # Telegram startup
+        # Telegram startup notification
         try:
             await self.notifier.send("🤖 Scheduler started — system running.")
         except:
@@ -82,7 +67,6 @@ class Scheduler:
 
         print("[Scheduler] Background loops running.")
 
-
     # ========================================================
     #          INITIAL BACKFILL OF ROOT TFs
     # ========================================================
@@ -94,18 +78,17 @@ class Scheduler:
                 # 1H
                 kl1h = await self.rest.get_klines(symbol, "60", limit=200)
                 if kl1h:
-                    self.store.replace_klines(symbol, "60", kl1h)
+                    self.store.save_candles(symbol, "60", kl1h)
 
                 # 4H
                 kl4h = await self.rest.get_klines(symbol, "240", limit=200)
                 if kl4h:
-                    self.store.replace_klines(symbol, "240", kl4h)
+                    self.store.save_candles(symbol, "240", kl4h)
 
             except Exception as e:
                 print(f"[Backfill] Error {symbol}: {e}")
 
         print("[Scheduler] Backfill complete.")
-
 
     # ========================================================
     #     ROOT TF SCAN (1H / 4H) — DETECT FLIPS
@@ -115,7 +98,7 @@ class Scheduler:
 
         for symbol in self.symbols:
             try:
-                kl = self.store.get_klines(symbol, tf)
+                kl = self.store.get_candles(symbol, tf)
                 if not kl or len(kl) < 35:
                     continue
 
@@ -133,12 +116,12 @@ class Scheduler:
 
                 # Flip detection
                 if flipped_negative_to_positive_at_open(hist, idx):
-                    self.store.save_signal(symbol, tf, open_ts)
+                    # Create signal with TTL (e.g., 3600 seconds)
+                    self.store.create_signal(symbol, tf, {"open": open_ts}, ttl_seconds=3600)
                     print(f"[ROOT FLIP] {symbol} TF={tf} @ {ts_to_dt(open_ts)}")
 
             except Exception as e:
                 print(f"[ROOT] Error {symbol}: {e}")
-
 
     # ========================================================
     #     DETECT 1H and 4H CANDLE OPENS
@@ -170,7 +153,6 @@ class Scheduler:
 
             await asyncio.sleep(1)
 
-
     # ========================================================
     #       WS MANAGER — SUBSCRIBE / UNSUBSCRIBE
     # ========================================================
@@ -182,7 +164,8 @@ class Scheduler:
                 root60 = self.store.get_active_signals("60")
                 root240 = self.store.get_active_signals("240")
 
-                needed = set(root60.keys()) | set(root240.keys())
+                # Determine symbols needed to subscribe (union of both lists)
+                needed = set(root60) | set(root240)
 
                 # Subscribe to new symbols
                 for sym in needed:
@@ -199,140 +182,20 @@ class Scheduler:
 
             await asyncio.sleep(30)
 
-
+    # ========================================================
     # Subscribe to 5m + 15m
+    # ========================================================
     async def _subscribe_symbol_live(self, symbol: str):
         self.active_ws[symbol] = True
         print(f"[WS] Live-Subscribe: {symbol}")
 
         for tf in self.ws_intervals:
-            await self.ws.subscribe_kline(
-                symbol, tf,
-                lambda msg, s=symbol, t=tf: asyncio.create_task(self._on_ws_kline(s, t, msg))
-            )
+            await self.ws.subscribe_kline(symbol, tf, self._on_kline)
 
-
-    # Unsubscribe symbol
     async def _unsubscribe_symbol_live(self, symbol: str):
+        if symbol in self.active_ws:
+            del self.active_ws[symbol]
         print(f"[WS] Live-Unsubscribe: {symbol}")
 
         for tf in self.ws_intervals:
             await self.ws.unsubscribe_kline(symbol, tf)
-
-        self.active_ws.pop(symbol, None)
-
-
-    # ========================================================
-    #       WS KLINE CALLBACK (5m / 15m)
-    # ========================================================
-    async def _on_ws_kline(self, symbol: str, tf: str, msg: dict):
-        try:
-            data = msg["data"][0]
-            open_ts = int(data["start"])
-            close = float(data["close"])
-
-            now_ms = int(time.time() * 1000)
-            if open_ts > now_ms + 60000:
-                print(f"[WARN] Skipping abnormal TS {open_ts} for {symbol}-{tf}")
-                return
-
-            # Save new candle
-            self.store.update_ws_kline(symbol, tf, open_ts, close)
-
-            # Check root signal
-            root_ts = self._get_root_signal(symbol)
-            if not root_ts:
-                return
-
-            # Must be the most recent open
-            if now_ms - open_ts > 35000:
-                return
-
-            # Confirm entry flip
-            if await self._check_entry_confirmation(symbol, tf):
-                await self._send_entry_alert(symbol, root_ts, tf, open_ts)
-
-        except Exception as e:
-            print(f"[WS ERROR] {symbol}-{tf}: {e}")
-
-
-    # ========================================================
-    #        ENTRY CONFIRMATION LOGIC
-    # ========================================================
-    async def _check_entry_confirmation(self, symbol: str, tf: str):
-        try:
-            kl = self.store.get_klines(symbol, tf)
-            if not kl or len(kl) < 35:
-                return False
-
-            kl = sorted(kl, key=lambda x: x["open"])
-            closes = [float(k["close"]) for k in kl]
-
-            _, _, hist = compute_macd_histogram(closes)
-            idx = len(hist) - 1
-
-            # Only count OPEN flip
-            if flipped_negative_to_positive_at_open(hist, idx):
-                print(f"[ENTRY] {symbol} confirmed on {tf}m @ {ts_to_dt(kl[idx]['open'])}")
-                return True
-
-        except Exception as e:
-            print(f"[ENTRY] Error {symbol}: {e}")
-
-        return False
-
-
-    # ========================================================
-    #              SEND TELEGRAM ENTRY ALERT
-    # ========================================================
-    async def _send_entry_alert(self, symbol, root_ts, entry_tf, entry_ts):
-        try:
-            msg = (
-                f"🚀 **ENTRY SIGNAL**\n"
-                f"Symbol: {symbol}\n"
-                f"Root TF: {self._root_tf_of(symbol)}\n"
-                f"Root Flip: {ts_to_dt(root_ts)}\n"
-                f"Entry TF: {entry_tf}m\n"
-                f"Entry Flip: {ts_to_dt(entry_ts)}"
-            )
-
-            print(msg)
-            await self.notifier.send(msg)
-
-            # Clean up
-            await self._unsubscribe_symbol_live(symbol)
-            self.store.delete_signal(symbol)
-
-        except Exception as e:
-            print(f"[ALERT] Error sending alert: {e}")
-
-
-    # ========================================================
-    #                  ROOT TF HELPER
-    # ========================================================
-    def _root_tf_of(self, symbol: str):
-        if self.store.get_signal(symbol, "60"):
-            return "1H"
-        if self.store.get_signal(symbol, "240"):
-            return "4H"
-        return "?"
-
-
-    # ========================================================
-    #                GET ROOT SIGNAL
-    # ========================================================
-    def _get_root_signal(self, symbol: str):
-        sig1 = self.store.get_signal(symbol, "60")
-        if sig1:
-            return sig1["ts"]
-
-        sig4 = self.store.get_signal(symbol, "240")
-        if sig4:
-            return sig4["ts"]
-
-        return None
-
-
-# ============================================================
-# END OF FILE
-# ============================================================
