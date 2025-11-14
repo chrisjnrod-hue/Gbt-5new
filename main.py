@@ -1,5 +1,5 @@
-# main.py (FINAL)
-
+# main.py
+"""Entry point for the FastAPI server and scheduler."""
 import os
 from fastapi import FastAPI
 from dotenv import load_dotenv
