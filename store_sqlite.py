@@ -1,3 +1,5 @@
+# store_sqlite.py
+"""SQLite-based persistence store for candle and signal data."""
 import sqlite3
 import json
 import time
@@ -9,7 +11,10 @@ DB_PATH = os.getenv("SQLITE_DB_PATH", "data.db")
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "100"))
 LAZY_TF_MAX_CANDLES = int(os.getenv("LAZY_TF_MAX_CANDLES", "300"))
 
-class SQLiteStore:
+class Store:
+    """
+    SQLite-based persistence store for candle data and trading signals.
+    """
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._lock = threading.Lock()
@@ -64,8 +69,10 @@ class SQLiteStore:
             conn.commit()
             conn.close()
 
-    # save candles list (expects list oldest->newest). Only store open_time and close.
     def save_candles(self, symbol: str, tf: str, candles: List[dict], maxlen: int = None):
+        """
+        Save a list of candles (each with open_time and close) to the database.
+        """
         maxlen = maxlen or (LAZY_TF_MAX_CANDLES if tf in self._lazy_tfs() else MAX_CANDLES)
         with self._lock:
             conn = self._connect()
@@ -89,13 +96,17 @@ class SQLiteStore:
             conn.close()
 
     def get_candles(self, symbol: str, tf: str) -> List[dict]:
+        """
+        Retrieve stored candles for a symbol and timeframe, ordered by time.
+        """
         with self._lock:
             conn = self._connect()
             c = conn.cursor()
             c.execute("SELECT open_time, close FROM candles WHERE symbol=? AND tf=? ORDER BY open_time ASC", (symbol, tf))
             rows = c.fetchall()
             conn.close()
-            return [{"open_time": r[0], "close": r[1]} for r in rows] if rows else []
+            # Return list of dicts with 'open' and 'close'
+            return [{"open": r[0], "close": r[1]} for r in rows] if rows else []
 
     # EMA state methods
     def get_ema_state(self, symbol: str, tf: str) -> Optional[dict]:
@@ -120,6 +131,9 @@ class SQLiteStore:
 
     # signal methods
     def create_signal(self, symbol: str, tf: str, meta: dict, ttl_seconds: int):
+        """
+        Create or replace a signal entry with given metadata and time-to-live.
+        """
         expiry = int(time.time()) + ttl_seconds
         with self._lock:
             conn = self._connect()
@@ -130,6 +144,9 @@ class SQLiteStore:
             conn.close()
 
     def delete_signal(self, symbol: str, tf: str):
+        """
+        Delete a signal entry for a symbol and timeframe.
+        """
         with self._lock:
             conn = self._connect()
             c = conn.cursor()
@@ -138,6 +155,9 @@ class SQLiteStore:
             conn.close()
 
     def get_active_signals(self, tf: str) -> List[str]:
+        """
+        Get list of symbols with active (non-expired) signals for a given timeframe.
+        """
         now = int(time.time())
         with self._lock:
             conn = self._connect()
@@ -147,7 +167,21 @@ class SQLiteStore:
             conn.close()
             return [r[0] for r in rows]
 
+    def clear_signals(self):
+        """
+        Delete all signals from the database.
+        """
+        with self._lock:
+            conn = self._connect()
+            c = conn.cursor()
+            c.execute("DELETE FROM signals")
+            conn.commit()
+            conn.close()
+
     def get_signal(self, symbol: str, tf: str) -> Optional[dict]:
+        """
+        Retrieve the metadata for a signal if it is still active (not expired).
+        """
         now = int(time.time())
         with self._lock:
             conn = self._connect()
@@ -163,6 +197,9 @@ class SQLiteStore:
             return meta
 
     def set_last_notified(self, symbol: str, tf: str, ts: int):
+        """
+        Update the 'last_notified' timestamp in the signal metadata.
+        """
         with self._lock:
             conn = self._connect()
             c = conn.cursor()
@@ -179,8 +216,10 @@ class SQLiteStore:
             conn.commit()
             conn.close()
 
-    # trimming utilities
     def trim_all(self, default_keep: int = MAX_CANDLES):
+        """
+        Trims candle tables for all symbol/timeframe combos to the default keep length.
+        """
         with self._lock:
             conn = self._connect()
             c = conn.cursor()
